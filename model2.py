@@ -223,7 +223,9 @@ class InvariantCrossAttention(nn.Module):
 
     def forward(self, atom, vector):
         # G[i,j] = <Z_E[i], Z_E[j]>; G is invariant under rotation.
+        # Divide by the feature dimension so Gram entries stay O(1).
         gram = torch.einsum("bixd,bjxd->bij", vector, vector)
+        gram = gram / vector.shape[-1]
         lattice_tokens = self.metric_embedding(gram)
         update, _ = self.attention(
             atom, lattice_tokens, lattice_tokens, need_weights=False
@@ -326,6 +328,7 @@ class CrystalDualStreamBlock(nn.Module):
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
         gram = torch.einsum("bixd,bjxd->bij", vector, vector)
+        gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
             atom_context[:, None, :].expand(-1, 3, -1),
             gram,
