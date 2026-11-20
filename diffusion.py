@@ -182,7 +182,6 @@ class DiffCSP(nn.Module):
             coord_norm = self.coord_sigmas_norm[timestep]
 
             # Corrector: add a small amount of coordinate noise, then denoise.
-            lattice_noise = torch.randn_like(lattice) if timestep > 1 else 0
             coord_noise = torch.randn_like(frac_coords) if timestep > 1 else 0
             corrector_step = step_lr * (
                 coord_sigma / self.coord_sigmas[1]
@@ -211,6 +210,11 @@ class DiffCSP(nn.Module):
                 * predictor_step
                 / coord_sigma.square()
             ).sqrt()
+
+            # Fresh noise for the predictor; the corrector and predictor must
+            # not share noise.
+            lattice_noise = torch.randn_like(lattice) if timestep > 1 else 0
+            coord_noise = torch.randn_like(frac_coords) if timestep > 1 else 0
 
             pred_lattice, pred_coords = self.denoiser(
                 time_emb,

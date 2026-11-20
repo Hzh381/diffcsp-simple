@@ -9,6 +9,7 @@ Hydra、PyTorch Lightning、W&B、E3NN 或 PyG。
 diffcsp_simple/
 ├─ data.py          # CSV/CIF 读取与缓存
 ├─ model1.py        # Crysformer、配置类与 CrysformerDenoiser 适配器
+├─ model2.py        # 双流 Transformer、配置类与 CrystalDualStreamDenoiser 适配器
 ├─ model.py         # 原有的 CSPNet（--model cspnet 时使用）
 ├─ diffusion.py     # 联合晶格/坐标扩散训练与采样
 ├─ train.py         # 普通 PyTorch 训练循环
@@ -25,15 +26,24 @@ diffcsp_simple/
     Gram 矩阵 + 傅里叶位移边特征、门控残差；控制参数集中在
     `model1.py` 的 `CrysformerConfig`，训练时按该配置创建模型。
   - `cspnet`：`model.py` 中原来的全连接消息传递网络。
+  - `dualstream`：`model2.py` 中的 `CrystalDualStreamTransformer`，一条原子
+    不变流（图注意力 + 晶格→原子交叉注意力）和一条晶格等变向量流
+    （`[B, 3, 3, D]`，由晶格矩阵列向量初始化）相互更新；控制参数集中在
+    `model2.py` 的 `CrystalDualStreamConfig`。`CrystalDualStreamDenoiser`
+    负责原子类型嵌入、时间嵌入、padded `[B, N]` 张量、padding mask，以及把
+    向量流投影为晶格噪声、把原子流投影为分数坐标 score。
 - 时间步编码沿用 `diffusion.py` 的 `SinusoidalTimeEmbedding`：`DiffCSP`
   先算出 `[B, time_dim]` 的时间特征，再传给去噪网络，因此扩散文件保持
   原有接口不变。
 - `model1.py` 中的 `CrysformerDenoiser` 只做形状适配：把 DiffCSP 的
   “拼接原子 + 图边界”批量转换为 Crysformer 需要的 padded `[B, N]` 张量与
   node mask，再把每个原子的分数坐标 score 按原顺序摊平。
-- 训练时把通用超参数（`hidden_dim`、`time_dim`、`num_layers`、
-  `num_frequencies`、`max_atoms`）填入对应模型的配置；checkpoint 中保存
-  模型名与配置，评估/采样据此自动重建。
+- `model2.py` 中的 `CrystalDualStreamDenoiser` 采用同样的适配方式。由于
+  模型主体只接收不变量原子特征，适配层额外注入时间嵌入和分数坐标傅里叶
+  嵌入；晶格噪声来自等变向量流的线性投影，分数坐标 score 来自原子流。
+- 训练时把通用超参数（`hidden_dim`、`time_dim`、`num_layers`、`max_atoms`；
+  Crysformer 与 cspnet 另用 `num_frequencies`）填入对应模型的配置；
+  checkpoint 中保存模型名与配置，评估/采样据此自动重建。
 - 与原 DiffCSP 一致：晶格 DDPM、分数坐标 wrapped-normal score matching、
   时间步条件网络、联合晶格与坐标生成。
 - 训练使用普通 PyTorch 循环，不再依赖 Lightning 的回调和 Hydra 配置系统。
@@ -72,24 +82,38 @@ python -m diffcsp_simple.train \
   --batch-size 256
 ```
 
+使用 `model2.py` 的双流 Transformer：
+
+```bash
+python -m diffcsp_simple.train \
+  --data-dir data/carbon_24 \
+  --output-dir outputs/diffcsp_simple \
+  --model dualstream \
+  --epochs 1000 \
+  --batch-size 256
+```
+
 常用参数：
 
 | 参数 | 含义 |
 | --- | --- |
 | `--data-dir` | 包含 `train.csv`、`val.csv`、`test.csv` 的目录 |
-| `--model` | 去噪模型：`crysformer`（默认）或 `cspnet` |
+| `--model` | 去噪模型：`crysformer`（默认）、`dualstream` 或 `cspnet` |
 | `--output-dir` | checkpoint 和日志输出目录 |
 | `--epochs` | 最大训练轮数 |
 | `--batch-size` | 每批晶体数 |
-| `--hidden-dim` | 节点与边特征维度（Crysformer 需被默认 8 头整除） |
+| `--hidden-dim` | 节点与边特征维度（Crysformer/dualstream 需被默认 8 头整除） |
 | `--num-layers` | 网络层数 |
-| `--num-frequencies` | 边特征傅里叶频率数 |
+| `--num-frequencies` | 边特征傅里叶频率数（Crysformer 与 cspnet 使用） |
 | `--max-atoms` | 原子序数词表上限（Crysformer 映射到 `max_atomic_number`） |
 | `--timesteps` | 扩散步数 |
 | `--patience` | 连续多少轮验证无改善后早停 |
 | `--resume` | 从 checkpoint 继续训练 |
 | `--limit-train` | 调试时只读取前 N 个训练样本 |
 | `--device` | `auto`、`cpu` 或 `cuda` |
+
+`dualstream` 额外使用 `CrystalDualStreamConfig` 中的 `heads=8`、`expansion=4`
+和 `dropout=0.0` 默认值，这些暂未暴露为命令行参数。
 
 首次读取 CSV 后会缓存为：
 

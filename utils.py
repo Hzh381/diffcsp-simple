@@ -10,6 +10,7 @@ from pymatgen.io.cif import CifWriter
 from .diffusion import DiffCSP
 from .model import CSPNet
 from .model1 import CrysformerConfig, CrysformerDenoiser
+from .model2 import CrystalDualStreamConfig, CrystalDualStreamDenoiser
 
 
 def torch_load(path, map_location="cpu"):
@@ -35,6 +36,8 @@ def build_denoiser(model_name, model_config):
     """Instantiate the selected denoiser from its serialized config."""
     if model_name == "cspnet":
         return CSPNet(**model_config)
+    if model_name == "dualstream":
+        return CrystalDualStreamDenoiser(CrystalDualStreamConfig(**model_config))
     return CrysformerDenoiser(CrysformerConfig(**model_config))
 
 
@@ -43,6 +46,9 @@ def load_diffusion(checkpoint_path, device):
     model_info = checkpoint["model_config"]
     if "model" in model_info:
         model = build_denoiser(model_info["model"], model_info["config"])
+    elif "max_atoms" in model_info:##此处做了修改
+        # Flat cspnet config written before configs were tagged with a model name.
+        model = build_denoiser("cspnet", model_info)###此处做了修改
     else:
         # Checkpoints written before the model switch stored a flat config.
         model = CrysformerDenoiser(CrysformerConfig(**model_info))

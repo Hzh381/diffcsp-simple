@@ -14,13 +14,18 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from .data import CrystalDataset, make_loader
 from .diffusion import DiffCSP
 from .model1 import CrysformerConfig
+from .model2 import CrystalDualStreamConfig
 from .utils import build_denoiser, resolve_device, seed_everything, torch_load
 
 
 def parse_args():
     parser = argparse.ArgumentParser("Train a compact DiffCSP")
     parser.add_argument("--data-dir", default="data/carbon_24")
-    parser.add_argument("--model", default="crysformer", choices=["crysformer", "cspnet"])
+    parser.add_argument(
+        "--model",
+        default="crysformer",
+        choices=["crysformer", "dualstream", "cspnet"],
+    )
     parser.add_argument("--output-dir", default="outputs/diffcsp_simple")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -129,6 +134,15 @@ def main():
             "max_atoms": args.max_atoms,
             "num_frequencies": args.num_frequencies,
         }
+    elif args.model == "dualstream":
+        config = asdict(
+            CrystalDualStreamConfig(
+                hidden_dim=args.hidden_dim,
+                time_dim=args.time_dim,
+                num_layers=args.num_layers,
+                max_atomic_number=args.max_atoms,
+            )
+        )
     else:
         config = asdict(
             CrysformerConfig(
