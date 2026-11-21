@@ -177,6 +177,26 @@ class LatticeVectorEmbedding(nn.Module):
         return lattice.transpose(1, 2).unsqueeze(-1) * self.scale
 
 
+class EquivariantRMSNorm(nn.Module):
+    """Scale each lattice vector by a rotation-invariant RMS.
+
+    The scalar is shared by the three Cartesian components, so a common
+    rotation still commutes with the normalization. A plain ``LayerNorm``
+    over the feature axis would rescale each component differently and
+    break equivariance.
+    """
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, vector):
+        rms = vector.pow(2).mean(dim=(2, 3), keepdim=True)
+        vector = vector * torch.rsqrt(rms + self.eps)
+        return vector * self.weight
+
+
 class EquivariantVectorAttention(nn.Module):
     """Self-attention over the three lattice vectors.
 
@@ -297,6 +317,7 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
         # Equivariant lattice stream.
+        self.vector_norm = EquivariantRMSNorm(dim)
         self.vector_attention = EquivariantVectorAttention(dim, dropout)
         self.vector_cross_attention = EquivariantCrossAttention(dim, dropout)
         self.vector_ffn_in = nn.Linear(dim, hidden, bias=False)
@@ -316,8 +337,10 @@ class CrystalDualStreamBlock(nn.Module):
         atom = atom + self.atom_ffn(self.atom_ffn_norm(atom))
 
         # 3. Lattice self-attention and atom -> lattice cross-attention.
-        vector = vector + self.vector_attention(vector)
-        vector = vector + self.vector_cross_attention(vector, atom, padding_mask)
+        vector = vector + self.vector_attention(self.vector_norm(vector))
+        vector = vector + self.vector_cross_attention(
+            self.vector_norm(vector), atom, padding_mask
+        )
 
         # 4. Equivariant FFN. Atom context and lattice metrics form scalar gates.
         if padding_mask is None:
@@ -327,16 +350,20 @@ class CrystalDualStreamBlock(nn.Module):
             atom_context = (atom * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
-        gram = torch.einsum("bixd,bjxd->bij", vector, vector)
+        # Normalize before building the metric so the gate sees bounded inputs.
+        vector_normed = self.vector_norm(vector)
+        gram = torch.einsum("bixd,bjxd->bij", vector_normed, vector_normed)
         gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
             atom_context[:, None, :].expand(-1, 3, -1),
             gram,
         ), dim=-1)
-        gate = self.vector_gate(lattice_context).unsqueeze(2)
+        # tanh keeps the gate bounded, preventing a vector -> gram -> gate
+        # positive feedback loop during long training runs.
+        gate = torch.tanh(self.vector_gate(lattice_context)).unsqueeze(2)
 
         # Equivariant channels are only multiplied by invariant scalar gates.
-        vector_hidden = self.vector_ffn_in(vector)
+        vector_hidden = self.vector_ffn_in(vector_normed)
         vector = vector + self.vector_ffn_out(vector_hidden * gate)
         return atom, vector
 
@@ -451,6 +478,7 @@ __all__ = [
     "CrystalDualStreamBlock",
     "CrystalDualStreamConfig",
     "CrystalDualStreamDenoiser",
+    "EquivariantRMSNorm",
 ]
 
 
