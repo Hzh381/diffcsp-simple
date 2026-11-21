@@ -370,30 +370,18 @@ class CrystalDualStreamBlock(nn.Module):
 
 
 class CrystalDualStreamTransformer(nn.Module):
-    """Complete multi-layer model; includes its own graph attention layers."""
+    """Stack of dual-stream blocks operating on precomputed features."""
 
-    def __init__(self, dim, depth=4, heads=4, edge_dim=0, expansion=4, dropout=0.0,
-                 time_dim=256):
+    def __init__(self, dim, depth=4, heads=4, edge_dim=0, expansion=4, dropout=0.0):
         super().__init__()
-        self.lattice_embedding = LatticeVectorEmbedding(dim)
-        self.time_projection = nn.Linear(time_dim, dim)
         self.blocks = nn.ModuleList([
             CrystalDualStreamBlock(dim, heads, edge_dim, expansion, dropout)
             for _ in range(depth)
         ])
         self.atom_norm = nn.LayerNorm(dim)
 
-    def forward(self, atom, lattice, edge_index=None, edge_attr=None,
-                padding_mask=None, time_embed=None):
-        vector = self.lattice_embedding(lattice)
-        if time_embed is not None:
-            # Time enters both streams: an additive shift for the invariant
-            # atom features, and a per-channel multiplicative gate for the
-            # equivariant lattice vectors. A per-channel scalar multiplies
-            # all three Cartesian components equally, so equivariance holds.
-            time_context = self.time_projection(time_embed)
-            atom = atom + time_context[:, None, :]
-            vector = vector * (1.0 + torch.tanh(time_context))[:, None, None, :]
+    def forward(self, atom, vector, edge_index=None, edge_attr=None,
+                padding_mask=None):
         for block in self.blocks:
             atom, vector = block(
                 atom, vector, edge_index, edge_attr, padding_mask
@@ -425,17 +413,18 @@ class CrystalDualStreamDenoiser(nn.Module):
             "frequencies",
             2 * math.pi * torch.arange(config.coord_frequencies),
         )
-        self.coord_embedding = nn.Linear(
-            6 * config.coord_frequencies, config.hidden_dim
-        )
+        # Edge features: Fourier embedding of the wrapped fractional
+        # displacement (6 * F) plus the 9 lattice-metric products, as in CSPNet.
+        self.edge_dim = 6 * config.coord_frequencies + 9
+        self.lattice_embedding = LatticeVectorEmbedding(config.hidden_dim)
+        self.time_projection = nn.Linear(config.time_dim, config.hidden_dim)
         self.net = CrystalDualStreamTransformer(
             config.hidden_dim,
             depth=config.num_layers,
             heads=config.heads,
-            edge_dim=0,
+            edge_dim=self.edge_dim,
             expansion=config.expansion,
             dropout=config.dropout,
-            time_dim=config.time_dim,
         )
         self.frac_head = nn.Linear(config.hidden_dim, 3, bias=False)
         # Contract the equivariant vector channels into one lattice per graph.
@@ -464,20 +453,44 @@ class CrystalDualStreamDenoiser(nn.Module):
         padded_frac[node2graph, positions] = frac_coords
         node_mask[node2graph, positions] = True
 
-        phase = padded_frac.unsqueeze(-1) * self.frequencies
-        coord_features = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
+        # Pairwise edges on the padded grid, ordered as (source=j, target=i)
+        # to match the dense attention layout. Padded atoms are masked out as
+        # keys by the attention itself.
+        grid = torch.cartesian_prod(
+            torch.arange(max_atoms, device=device),
+            torch.arange(max_atoms, device=device),
+        )
+        source, target = grid[:, 1], grid[:, 0]
+        edge_index = grid[:, [1, 0]].t().contiguous()
+
+        # Fourier embedding of the wrapped fractional displacement, plus the
+        # lattice-metric products, following CSPNet's edge features.
+        frac_diff = (padded_frac[:, target] - padded_frac[:, source]) % 1.0
+        phase = frac_diff.unsqueeze(-1) * self.frequencies
+        frac_embedding = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
+        lattice_products = (lattice @ lattice.transpose(-1, -2)).flatten(-2)
+        edge_attr = torch.cat((
+            frac_embedding,
+            lattice_products[:, None, :].expand(-1, grid.size(0), -1),
+        ), dim=-1)
 
         atom = self.atom_embedding(padded_types.long())
-        atom = atom + self.coord_embedding(coord_features)
         # The transformer expects columns to be lattice vectors; data.py
         # stores lattice vectors as rows.
+        vector = self.lattice_embedding(lattice.transpose(-1, -2))
+        # Time conditioning is fused here, before the transformer: an additive
+        # shift for the invariant atom features and a per-channel gate for the
+        # equivariant lattice vectors.
+        time_context = self.time_projection(time_emb)
+        atom = atom + time_context[:, None, :]
+        vector = vector * (1.0 + torch.tanh(time_context))[:, None, None, :]
+
         atom, vector = self.net(
             atom,
-            lattice.transpose(-1, -2),
-            edge_index=None,
-            edge_attr=None,
+            vector,
+            edge_index,
+            edge_attr,
             padding_mask=~node_mask,
-            time_embed=time_emb,
         )
 
         frac_score = self.frac_head(atom)
@@ -507,10 +520,11 @@ if __name__ == "__main__":
     model = CrystalDualStreamTransformer(
         dim=dim, depth=2, heads=4, edge_dim=edge_dim
     )
-    time_embed = torch.randn(batch, 256)
+    embedding = LatticeVectorEmbedding(dim)
+    vector = embedding(lattice)
 
     atom_out, vector_out = model(
-        atom, lattice, edge_index, edge_attr, padding_mask, time_embed
+        atom, vector, edge_index, edge_attr, padding_mask
     )
     loss = atom_out.square().mean() + vector_out.square().mean()
     loss.backward()
@@ -524,8 +538,8 @@ if __name__ == "__main__":
     model.eval()
     rotation, _ = torch.linalg.qr(torch.randn(batch, 3, 3))
     rotated_atom, rotated_vector = model(
-        atom.detach(), rotation @ lattice, edge_index, edge_attr,
-        padding_mask, time_embed
+        atom.detach(), embedding(rotation @ lattice), edge_index, edge_attr,
+        padding_mask
     )
     expected_vector = torch.einsum("bij,bmjd->bmid", rotation, vector_out.detach())
     print("atom rotation error:",
