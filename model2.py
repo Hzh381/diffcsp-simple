@@ -32,7 +32,7 @@ class CrystalDualStreamConfig:
     time_dim: int = 128
     max_atomic_number: int = 100
     expansion: int = 4
-    coord_frequencies: int = 8
+    coord_frequencies: int = 128
     dropout: float = 0.0
 
     def __post_init__(self) -> None:
