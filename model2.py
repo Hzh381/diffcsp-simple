@@ -314,7 +314,7 @@ class CrystalDualStreamBlock(nn.Module):
         # Zero-initialized, so every norm starts unmodulated.
         self.modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_dim, 9 * dim),
+            nn.Linear(time_dim, 6 * dim),
         )
         nn.init.zeros_(self.modulation[1].weight)
         nn.init.zeros_(self.modulation[1].bias)
@@ -323,7 +323,6 @@ class CrystalDualStreamBlock(nn.Module):
         # norm come from the time modulation, as in DiT's adaLN.
         self.atom_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.atom_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.atom_norm3 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.graph_attention = InvariantGraphAttention(
             dim, heads, edge_dim, dropout
         )
@@ -340,7 +339,6 @@ class CrystalDualStreamBlock(nn.Module):
         # Equivariant lattice stream.
         self.vector_norm1 = EquivariantRMSNorm(dim)
         self.vector_norm2 = EquivariantRMSNorm(dim)
-        self.vector_norm3 = EquivariantRMSNorm(dim)
         self.vector_attention = EquivariantVectorAttention(dim, dropout)
         self.vector_cross_attention = EquivariantCrossAttention(dim, dropout)
         self.vector_ffn_in = nn.Linear(dim, hidden, bias=False)
@@ -352,10 +350,10 @@ class CrystalDualStreamBlock(nn.Module):
     def forward(self, atom, vector, edge_index=None, edge_attr=None,
                 padding_mask=None, time_embed=None):
         if time_embed is None:
-            mods = (None,) * 9
+            mods = (None,) * 6
         else:
-            mods = self.modulation(time_embed).chunk(9, dim=-1)
-        a1, b1, a2, b2, a3, b3, a4, a5, a6 = mods
+            mods = self.modulation(time_embed).chunk(6, dim=-1)
+        a2, b2, a3, b3, a4, a5 = mods
 
         def atom_norm(norm, x, scale, shift):
             x = norm(x)
@@ -380,20 +378,18 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
         # 3. Atom feed forward.
-        atom = atom + self.atom_ffn(atom_norm(self.atom_norm3, atom, a1, b1))
+        atom = atom + self.atom_ffn(atom)
 
         # 4. Equivariant feed forward: channel mixing gated by invariant
         # scalars. An elementwise activation on xyz would break equivariance.
-        atom_for_gate = atom_norm(self.atom_norm3, atom, a1, b1)
         if padding_mask is None:
-            atom_context = atom_for_gate.mean(dim=1)
+            atom_context = atom.mean(dim=1)
         else:
             valid = (~padding_mask).to(atom.dtype).unsqueeze(-1)
-            atom_context = (atom_for_gate * valid).sum(dim=1)
+            atom_context = (atom * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
-        vector_normed = self.vector_norm3(vector, a6)
-        gram = torch.einsum("bixd,bjxd->bij", vector_normed, vector_normed)
+        gram = torch.einsum("bixd,bjxd->bij", vector, vector)
         gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
             atom_context[:, None, :].expand(-1, 3, -1),
@@ -401,7 +397,7 @@ class CrystalDualStreamBlock(nn.Module):
         ), dim=-1)
         gate = torch.tanh(self.vector_gate(lattice_context)).unsqueeze(2)
 
-        vector_hidden = self.vector_ffn_in(vector_normed)
+        vector_hidden = self.vector_ffn_in(vector)
         vector = vector + self.vector_ffn_out(vector_hidden * gate)
         return atom, vector
 
