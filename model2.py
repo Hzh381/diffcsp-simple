@@ -470,6 +470,12 @@ class CrystalDualStreamDenoiser(nn.Module):
         self.frac_head = nn.Linear(config.hidden_dim, 3, bias=False)
         # Contract the equivariant vector channels into one lattice per graph.
         self.lattice_head = nn.Linear(config.hidden_dim, 1, bias=False)
+        # Turn the invariant lattice metric into a 3x3 coefficient matrix.
+        self.lattice_coeff = nn.Sequential(
+            nn.Linear(9, config.hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.hidden_dim, 9),
+        )
 
     def forward(
         self,
@@ -511,7 +517,13 @@ class CrystalDualStreamDenoiser(nn.Module):
         )
 
         frac_score = self.frac_head(atom)
-        lattice_noise = self.lattice_head(vector).squeeze(-1)
+        # Row Gram: G[i,j] = sum_xyz H[i,xyz] * H[j,xyz] is rotation invariant
+        # because H -> H R^T gives H R^T R H^T = H H^T. The coefficient matrix
+        # is therefore invariant, and C @ L rotates together with the lattice.
+        head = self.lattice_head(vector).squeeze(-1)
+        gram = torch.bmm(head, head.transpose(-1, -2))
+        coeff = self.lattice_coeff(gram.flatten(-2)).view(-1, 3, 3)
+        lattice_noise = torch.bmm(coeff, lattice)
         return lattice_noise, frac_score[node_mask]
 
 
