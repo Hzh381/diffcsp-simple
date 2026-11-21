@@ -188,17 +188,12 @@ class EquivariantRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-6):
         super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, vector, scale=None):
+    def forward(self, vector):
         rms = vector.pow(2).mean(dim=(2, 3), keepdim=True)
-        vector = vector * torch.rsqrt(rms + self.eps)
-        if scale is not None:
-            # Per-channel modulation; a per-channel scalar multiplies all
-            # three Cartesian components equally, so equivariance is kept.
-            # This is the only affine term, mirroring adaLN in DiT.
-            vector = vector * (1.0 + scale)[:, None, None, :]
-        return vector
+        return vector * torch.rsqrt(rms + self.eps) * self.weight
 
 
 class EquivariantVectorAttention(nn.Module):
@@ -301,28 +296,13 @@ class EquivariantCrossAttention(nn.Module):
 class CrystalDualStreamBlock(nn.Module):
     """One block containing both the invariant and equivariant streams."""
 
-    def __init__(self, dim, heads=4, edge_dim=0, expansion=4, dropout=0.0,
-                 time_dim=256):
+    def __init__(self, dim, heads=4, edge_dim=0, expansion=4, dropout=0.0):
         super().__init__()
         hidden = dim * expansion
 
-        # DiT-style conditioning: the time embedding produces one adaptive
-        # parameter per normalization layer. The three atom LayerNorms get a
-        # (scale, shift) pair each (a1/b1, a2/b2, a3/b3); the three equivariant
-        # RMSNorms get a scale each (a4, a5, a6), since an additive shift on
-        # Cartesian components would break rotation equivariance.
-        # Zero-initialized, so every norm starts unmodulated.
-        self.modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_dim, 6 * dim),
-        )
-        nn.init.zeros_(self.modulation[1].weight)
-        nn.init.zeros_(self.modulation[1].bias)
-
-        # Invariant atom stream. No built-in affine: the shift/scale of every
-        # norm come from the time modulation, as in DiT's adaLN.
-        self.atom_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.atom_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        # Invariant atom stream.
+        self.atom_norm1 = nn.LayerNorm(dim)
+        self.atom_norm2 = nn.LayerNorm(dim)
         self.graph_attention = InvariantGraphAttention(
             dim, heads, edge_dim, dropout
         )
@@ -348,30 +328,17 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
     def forward(self, atom, vector, edge_index=None, edge_attr=None,
-                padding_mask=None, time_embed=None):
-        if time_embed is None:
-            mods = (None,) * 6
-        else:
-            mods = self.modulation(time_embed).chunk(6, dim=-1)
-        a2, b2, a3, b3, a4, a5 = mods
-
-        def atom_norm(norm, x, scale, shift):
-            x = norm(x)
-            if scale is not None:
-                x = x * (1.0 + scale[:, None]) + shift[:, None]
-            return x
-
+                padding_mask=None):
         # 1. Intra-stream attention: pre-norm, residual bypass.
         atom = atom + self.graph_attention(
-            atom_norm(self.atom_norm1, atom, a3, b3),
-            edge_index, edge_attr, padding_mask,
+            self.atom_norm1(atom), edge_index, edge_attr, padding_mask,
         )
-        vector = vector + self.vector_attention(self.vector_norm1(vector, a4))
+        vector = vector + self.vector_attention(self.vector_norm1(vector))
 
         # 2. Cross-stream attention: both blocks consume the pre-cross
-        # normalized features of both streams (the crossing arrows).
-        atom_normed = atom_norm(self.atom_norm2, atom, a2, b2)
-        vector_normed = self.vector_norm2(vector, a5)
+        # normalized features of both streams.
+        atom_normed = self.atom_norm2(atom)
+        vector_normed = self.vector_norm2(vector)
         atom = atom + self.atom_cross_attention(atom_normed, vector_normed)
         vector = vector + self.vector_cross_attention(
             vector_normed, atom_normed, padding_mask
@@ -409,10 +376,9 @@ class CrystalDualStreamTransformer(nn.Module):
                  time_dim=256):
         super().__init__()
         self.lattice_embedding = LatticeVectorEmbedding(dim)
+        self.time_projection = nn.Linear(time_dim, dim)
         self.blocks = nn.ModuleList([
-            CrystalDualStreamBlock(
-                dim, heads, edge_dim, expansion, dropout, time_dim
-            )
+            CrystalDualStreamBlock(dim, heads, edge_dim, expansion, dropout)
             for _ in range(depth)
         ])
         self.atom_norm = nn.LayerNorm(dim)
@@ -420,9 +386,17 @@ class CrystalDualStreamTransformer(nn.Module):
     def forward(self, atom, lattice, edge_index=None, edge_attr=None,
                 padding_mask=None, time_embed=None):
         vector = self.lattice_embedding(lattice)
+        if time_embed is not None:
+            # Time enters both streams: an additive shift for the invariant
+            # atom features, and a per-channel multiplicative gate for the
+            # equivariant lattice vectors. A per-channel scalar multiplies
+            # all three Cartesian components equally, so equivariance holds.
+            time_context = self.time_projection(time_embed)
+            atom = atom + time_context[:, None, :]
+            vector = vector * (1.0 + torch.tanh(time_context))[:, None, None, :]
         for block in self.blocks:
             atom, vector = block(
-                atom, vector, edge_index, edge_attr, padding_mask, time_embed
+                atom, vector, edge_index, edge_attr, padding_mask
             )
         return self.atom_norm(atom), vector
 
