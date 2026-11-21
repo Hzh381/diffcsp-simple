@@ -188,13 +188,17 @@ class EquivariantRMSNorm(nn.Module):
 
     def __init__(self, dim, eps=1e-6):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, vector):
+    def forward(self, vector, scale=None):
         rms = vector.pow(2).mean(dim=(2, 3), keepdim=True)
         vector = vector * torch.rsqrt(rms + self.eps)
-        return vector * self.weight
+        if scale is not None:
+            # Per-channel modulation; a per-channel scalar multiplies all
+            # three Cartesian components equally, so equivariance is kept.
+            # This is the only affine term, mirroring adaLN in DiT.
+            vector = vector * (1.0 + scale)[:, None, None, :]
+        return vector
 
 
 class EquivariantVectorAttention(nn.Module):
@@ -297,14 +301,27 @@ class EquivariantCrossAttention(nn.Module):
 class CrystalDualStreamBlock(nn.Module):
     """One block containing both the invariant and equivariant streams."""
 
-    def __init__(self, dim, heads=4, edge_dim=0, expansion=4, dropout=0.0):
+    def __init__(self, dim, heads=4, edge_dim=0, expansion=4, dropout=0.0,
+                 time_dim=256):
         super().__init__()
         hidden = dim * expansion
 
-        # Invariant atom stream.
-        self.atom_norm1 = nn.LayerNorm(dim) 
-        self.atom_norm2 = nn.LayerNorm(dim)
-        self.atom_norm3 = nn.LayerNorm(dim)
+        # DiT-style conditioning: the time embedding produces per-channel
+        # shift/scale for the atom norms and scale for the equivariant norms,
+        # plus residual gates. Zero-initialized, so shifts/scales start at 0
+        # and gates at 1, matching an unmodulated residual block at init.
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, 5 * dim),
+        )
+        nn.init.zeros_(self.modulation[1].weight)
+        nn.init.zeros_(self.modulation[1].bias)
+
+        # Invariant atom stream. No built-in affine: the shift/scale of every
+        # norm come from the time modulation, as in DiT's adaLN.
+        self.atom_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.atom_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.atom_norm3 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.graph_attention = InvariantGraphAttention(
             dim, heads, edge_dim, dropout
         )
@@ -330,28 +347,55 @@ class CrystalDualStreamBlock(nn.Module):
             nn.Linear(dim + 3, hidden), nn.GELU()
         )
 
-    def forward(self, atom, vector, edge_index=None, edge_attr=None, padding_mask=None):
+    def forward(self, atom, vector, edge_index=None, edge_attr=None,
+                padding_mask=None, time_embed=None):
+        if time_embed is None:
+            a_shift = a_scale = a_gate = v_scale = v_gate = None
+        else:
+            shift, scale, gate, vscale, vgate = self.modulation(time_embed).chunk(5, dim=-1)
+            a_shift = shift[:, None]
+            a_scale = scale[:, None]
+            # tanh bounds the residual gates to (0, 2).
+            a_gate = (1.0 + torch.tanh(gate))[:, None]
+            v_scale = vscale
+            v_gate = (1.0 + torch.tanh(vgate))[:, None, None, :]
+
+        def atom_norm(norm, x):
+            x = norm(x)
+            if a_shift is not None:
+                x = x * (1.0 + a_scale) + a_shift
+            return x
+
+        def gate_update(update, gate):
+            return update if gate is None else gate * update
+
         # 1. Intra-stream attention: pre-norm, residual bypass.
-        atom = atom + self.graph_attention(
-            self.atom_norm1(atom), edge_index, edge_attr, padding_mask
+        atom = atom + gate_update(self.graph_attention(
+            atom_norm(self.atom_norm1, atom), edge_index, edge_attr, padding_mask
+        ), a_gate)
+        vector = vector + gate_update(
+            self.vector_attention(self.vector_norm1(vector, v_scale)), v_gate
         )
-        vector = vector + self.vector_attention(self.vector_norm1(vector))
 
         # 2. Cross-stream attention: both blocks consume the pre-cross
         # normalized features of both streams (the crossing arrows).
-        atom_normed = self.atom_norm2(atom)
-        vector_normed = self.vector_norm2(vector)
-        atom = atom + self.atom_cross_attention(atom_normed, vector_normed)
-        vector = vector + self.vector_cross_attention(
-            vector_normed, atom_normed, padding_mask
+        atom_normed = atom_norm(self.atom_norm2, atom)
+        vector_normed = self.vector_norm2(vector, v_scale)
+        atom = atom + gate_update(
+            self.atom_cross_attention(atom_normed, vector_normed), a_gate
         )
+        vector = vector + gate_update(self.vector_cross_attention(
+            vector_normed, atom_normed, padding_mask
+        ), v_gate)
 
         # 3. Atom feed forward.
-        atom = atom + self.atom_ffn(self.atom_norm3(atom))
+        atom = atom + gate_update(
+            self.atom_ffn(atom_norm(self.atom_norm3, atom)), a_gate
+        )
 
         # 4. Equivariant feed forward: channel mixing gated by invariant
         # scalars. An elementwise activation on xyz would break equivariance.
-        atom_for_gate = self.atom_norm3(atom)
+        atom_for_gate = atom_norm(self.atom_norm3, atom)
         if padding_mask is None:
             atom_context = atom_for_gate.mean(dim=1)
         else:
@@ -359,7 +403,7 @@ class CrystalDualStreamBlock(nn.Module):
             atom_context = (atom_for_gate * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
-        vector_normed = self.vector_norm3(vector)
+        vector_normed = self.vector_norm3(vector, v_scale)
         gram = torch.einsum("bixd,bjxd->bij", vector_normed, vector_normed)
         gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
@@ -369,34 +413,33 @@ class CrystalDualStreamBlock(nn.Module):
         gate = torch.tanh(self.vector_gate(lattice_context)).unsqueeze(2)
 
         vector_hidden = self.vector_ffn_in(vector_normed)
-        vector = vector + self.vector_ffn_out(vector_hidden * gate)
+        vector = vector + gate_update(
+            self.vector_ffn_out(vector_hidden * gate), v_gate
+        )
         return atom, vector
 
 
 class CrystalDualStreamTransformer(nn.Module):
     """Complete multi-layer model; includes its own graph attention layers."""
 
-    def __init__(self, dim, depth=4, heads=4, edge_dim=0, expansion=4, dropout=0.0):
+    def __init__(self, dim, depth=4, heads=4, edge_dim=0, expansion=4, dropout=0.0,
+                 time_dim=256):
         super().__init__()
         self.lattice_embedding = LatticeVectorEmbedding(dim)
         self.blocks = nn.ModuleList([
-            CrystalDualStreamBlock(dim, heads, edge_dim, expansion, dropout)
+            CrystalDualStreamBlock(
+                dim, heads, edge_dim, expansion, dropout, time_dim
+            )
             for _ in range(depth)
         ])
         self.atom_norm = nn.LayerNorm(dim)
 
     def forward(self, atom, lattice, edge_index=None, edge_attr=None,
-                padding_mask=None, vector_cond=None):
+                padding_mask=None, time_embed=None):
         vector = self.lattice_embedding(lattice)
-        if vector_cond is not None:
-            # Additive bias would break rotation equivariance: a constant added
-            # to every Cartesian component is not invariant under rotation.
-            # A per-channel modulation scales all components equally instead.
-            # tanh bounds the factor to (0, 2) so it cannot amplify without limit.
-            vector = vector * (1.0 + torch.tanh(vector_cond))[:, None, None, :]
         for block in self.blocks:
             atom, vector = block(
-                atom, vector, edge_index, edge_attr, padding_mask
+                atom, vector, edge_index, edge_attr, padding_mask, time_embed
             )
         return self.atom_norm(atom), vector
 
@@ -421,7 +464,6 @@ class CrystalDualStreamDenoiser(nn.Module):
         self.atom_embedding = nn.Embedding(
             config.max_atomic_number + 1, config.hidden_dim
         )
-        self.time_projection = nn.Linear(config.time_dim, config.hidden_dim)
         self.register_buffer(
             "frequencies",
             2 * math.pi * torch.arange(config.coord_frequencies),
@@ -436,6 +478,7 @@ class CrystalDualStreamDenoiser(nn.Module):
             edge_dim=0,
             expansion=config.expansion,
             dropout=config.dropout,
+            time_dim=config.time_dim,
         )
         self.frac_head = nn.Linear(config.hidden_dim, 3, bias=False)
         # Contract the equivariant vector channels into one lattice per graph.
@@ -468,8 +511,6 @@ class CrystalDualStreamDenoiser(nn.Module):
         coord_features = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
 
         atom = self.atom_embedding(padded_types.long())
-        time_vec = self.time_projection(time_emb)
-        atom = atom + time_vec[:, None]
         atom = atom + self.coord_embedding(coord_features)
         # The transformer expects columns to be lattice vectors; data.py
         # stores lattice vectors as rows.
@@ -479,7 +520,7 @@ class CrystalDualStreamDenoiser(nn.Module):
             edge_index=None,
             edge_attr=None,
             padding_mask=~node_mask,
-            vector_cond=time_vec,
+            time_embed=time_emb,
         )
 
         frac_score = self.frac_head(atom)
@@ -509,9 +550,10 @@ if __name__ == "__main__":
     model = CrystalDualStreamTransformer(
         dim=dim, depth=2, heads=4, edge_dim=edge_dim
     )
+    time_embed = torch.randn(batch, 256)
 
     atom_out, vector_out = model(
-        atom, lattice, edge_index, edge_attr, padding_mask
+        atom, lattice, edge_index, edge_attr, padding_mask, time_embed
     )
     loss = atom_out.square().mean() + vector_out.square().mean()
     loss.backward()
@@ -525,7 +567,8 @@ if __name__ == "__main__":
     model.eval()
     rotation, _ = torch.linalg.qr(torch.randn(batch, 3, 3))
     rotated_atom, rotated_vector = model(
-        atom.detach(), rotation @ lattice, edge_index, edge_attr, padding_mask
+        atom.detach(), rotation @ lattice, edge_index, edge_attr,
+        padding_mask, time_embed
     )
     expected_vector = torch.einsum("bij,bmjd->bmid", rotation, vector_out.detach())
     print("atom rotation error:",
