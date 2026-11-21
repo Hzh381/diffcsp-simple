@@ -302,12 +302,14 @@ class CrystalDualStreamBlock(nn.Module):
         hidden = dim * expansion
 
         # Invariant atom stream.
-        self.atom_norm = nn.LayerNorm(dim)
+        self.atom_norm1 = nn.LayerNorm(dim) 
+        self.atom_norm2 = nn.LayerNorm(dim)
+        self.atom_norm3 = nn.LayerNorm(dim)
         self.graph_attention = InvariantGraphAttention(
             dim, heads, edge_dim, dropout
         )
         self.atom_cross_attention = InvariantCrossAttention(dim, heads, dropout)
-        self.atom_ffn_norm = nn.LayerNorm(dim)
+       
         self.atom_ffn = nn.Sequential(
             nn.Linear(dim, hidden),
             nn.GELU(),
@@ -317,7 +319,9 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
         # Equivariant lattice stream.
-        self.vector_norm = EquivariantRMSNorm(dim)
+        self.vector_norm1 = EquivariantRMSNorm(dim)
+        self.vector_norm2 = EquivariantRMSNorm(dim)
+        self.vector_norm3 = EquivariantRMSNorm(dim)
         self.vector_attention = EquivariantVectorAttention(dim, dropout)
         self.vector_cross_attention = EquivariantCrossAttention(dim, dropout)
         self.vector_ffn_in = nn.Linear(dim, hidden, bias=False)
@@ -327,57 +331,45 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
     def forward(self, atom, vector, edge_index=None, edge_attr=None, padding_mask=None):
-        # 1. Atom self-attention (graph attention).
+        # 1. Intra-stream attention: pre-norm, residual bypass.
         atom = atom + self.graph_attention(
-            self.atom_norm(atom), edge_index, edge_attr, padding_mask
+            self.atom_norm1(atom), edge_index, edge_attr, padding_mask
+        )
+        vector = vector + self.vector_attention(self.vector_norm1(vector))
+
+        # 2. Cross-stream attention: both blocks consume the pre-cross
+        # normalized features of both streams (the crossing arrows).
+        atom_normed = self.atom_norm2(atom)
+        vector_normed = self.vector_norm2(vector)
+        atom = atom + self.atom_cross_attention(atom_normed, vector_normed)
+        vector = vector + self.vector_cross_attention(
+            vector_normed, atom_normed, padding_mask
         )
 
-        # 2. Lattice -> atom cross-attention.
-        # Both operands are normalized: the raw residuals are unbounded, and
-        # this path feeds the other stream, so consuming them directly creates
-        # an atom <-> vector feedback loop.
-        atom = atom + self.atom_cross_attention(
-            self.atom_ffn_norm(atom), self.vector_norm(vector)
-        )
-        atom = atom + self.atom_ffn(self.atom_ffn_norm(atom))
+        # 3. Atom feed forward.
+        atom = atom + self.atom_ffn(self.atom_norm3(atom))
 
-        # 3. Lattice self-attention and atom -> lattice cross-attention.
-        vector = self.vector_norm(
-            vector + self.vector_attention(self.vector_norm(vector))
-        )
-        vector = self.vector_norm(
-            vector
-            + self.vector_cross_attention(
-                self.vector_norm(vector), self.atom_ffn_norm(atom), padding_mask
-            )
-        )
-
-        # 4. Equivariant FFN. Atom context and lattice metrics form scalar gates.
-        atom_normed = self.atom_ffn_norm(atom)
+        # 4. Equivariant feed forward: channel mixing gated by invariant
+        # scalars. An elementwise activation on xyz would break equivariance.
+        atom_for_gate = self.atom_norm3(atom)
         if padding_mask is None:
-            atom_context = atom_normed.mean(dim=1)
+            atom_context = atom_for_gate.mean(dim=1)
         else:
             valid = (~padding_mask).to(atom.dtype).unsqueeze(-1)
-            atom_context = (atom_normed * valid).sum(dim=1)
+            atom_context = (atom_for_gate * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
-        # Normalize before building the metric so the gate sees bounded inputs.
-        vector_normed = self.vector_norm(vector)
+        vector_normed = self.vector_norm3(vector)
         gram = torch.einsum("bixd,bjxd->bij", vector_normed, vector_normed)
         gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
             atom_context[:, None, :].expand(-1, 3, -1),
             gram,
         ), dim=-1)
-        # tanh keeps the gate bounded, preventing a vector -> gram -> gate
-        # positive feedback loop during long training runs.
         gate = torch.tanh(self.vector_gate(lattice_context)).unsqueeze(2)
 
-        # Equivariant channels are only multiplied by invariant scalar gates.
         vector_hidden = self.vector_ffn_in(vector_normed)
-        vector = self.vector_norm(
-            vector + self.vector_ffn_out(vector_hidden * gate)
-        )
+        vector = vector + self.vector_ffn_out(vector_hidden * gate)
         return atom, vector
 
 
