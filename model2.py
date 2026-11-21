@@ -306,13 +306,15 @@ class CrystalDualStreamBlock(nn.Module):
         super().__init__()
         hidden = dim * expansion
 
-        # DiT-style conditioning: the time embedding produces per-channel
-        # shift/scale for the atom norms and scale for the equivariant norms,
-        # plus residual gates. Zero-initialized, so shifts/scales start at 0
-        # and gates at 1, matching an unmodulated residual block at init.
+        # DiT-style conditioning: the time embedding produces one adaptive
+        # parameter per normalization layer. The three atom LayerNorms get a
+        # (scale, shift) pair each (a1/b1, a2/b2, a3/b3); the three equivariant
+        # RMSNorms get a scale each (a4, a5, a6), since an additive shift on
+        # Cartesian components would break rotation equivariance.
+        # Zero-initialized, so every norm starts unmodulated.
         self.modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_dim, 5 * dim),
+            nn.Linear(time_dim, 9 * dim),
         )
         nn.init.zeros_(self.modulation[1].weight)
         nn.init.zeros_(self.modulation[1].bias)
@@ -350,52 +352,39 @@ class CrystalDualStreamBlock(nn.Module):
     def forward(self, atom, vector, edge_index=None, edge_attr=None,
                 padding_mask=None, time_embed=None):
         if time_embed is None:
-            a_shift = a_scale = a_gate = v_scale = v_gate = None
+            mods = (None,) * 9
         else:
-            shift, scale, gate, vscale, vgate = self.modulation(time_embed).chunk(5, dim=-1)
-            a_shift = shift[:, None]
-            a_scale = scale[:, None]
-            # tanh bounds the residual gates to (0, 2).
-            a_gate = (1.0 + torch.tanh(gate))[:, None]
-            v_scale = vscale
-            v_gate = (1.0 + torch.tanh(vgate))[:, None, None, :]
+            mods = self.modulation(time_embed).chunk(9, dim=-1)
+        a1, b1, a2, b2, a3, b3, a4, a5, a6 = mods
 
-        def atom_norm(norm, x):
+        def atom_norm(norm, x, scale, shift):
             x = norm(x)
-            if a_shift is not None:
-                x = x * (1.0 + a_scale) + a_shift
+            if scale is not None:
+                x = x * (1.0 + scale[:, None]) + shift[:, None]
             return x
 
-        def gate_update(update, gate):
-            return update if gate is None else gate * update
-
         # 1. Intra-stream attention: pre-norm, residual bypass.
-        atom = atom + gate_update(self.graph_attention(
-            atom_norm(self.atom_norm1, atom), edge_index, edge_attr, padding_mask
-        ), a_gate)
-        vector = vector + gate_update(
-            self.vector_attention(self.vector_norm1(vector, v_scale)), v_gate
+        atom = atom + self.graph_attention(
+            atom_norm(self.atom_norm1, atom, a3, b3),
+            edge_index, edge_attr, padding_mask,
         )
+        vector = vector + self.vector_attention(self.vector_norm1(vector, a4))
 
         # 2. Cross-stream attention: both blocks consume the pre-cross
         # normalized features of both streams (the crossing arrows).
-        atom_normed = atom_norm(self.atom_norm2, atom)
-        vector_normed = self.vector_norm2(vector, v_scale)
-        atom = atom + gate_update(
-            self.atom_cross_attention(atom_normed, vector_normed), a_gate
-        )
-        vector = vector + gate_update(self.vector_cross_attention(
+        atom_normed = atom_norm(self.atom_norm2, atom, a2, b2)
+        vector_normed = self.vector_norm2(vector, a5)
+        atom = atom + self.atom_cross_attention(atom_normed, vector_normed)
+        vector = vector + self.vector_cross_attention(
             vector_normed, atom_normed, padding_mask
-        ), v_gate)
+        )
 
         # 3. Atom feed forward.
-        atom = atom + gate_update(
-            self.atom_ffn(atom_norm(self.atom_norm3, atom)), a_gate
-        )
+        atom = atom + self.atom_ffn(atom_norm(self.atom_norm3, atom, a1, b1))
 
         # 4. Equivariant feed forward: channel mixing gated by invariant
         # scalars. An elementwise activation on xyz would break equivariance.
-        atom_for_gate = atom_norm(self.atom_norm3, atom)
+        atom_for_gate = atom_norm(self.atom_norm3, atom, a1, b1)
         if padding_mask is None:
             atom_context = atom_for_gate.mean(dim=1)
         else:
@@ -403,7 +392,7 @@ class CrystalDualStreamBlock(nn.Module):
             atom_context = (atom_for_gate * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
-        vector_normed = self.vector_norm3(vector, v_scale)
+        vector_normed = self.vector_norm3(vector, a6)
         gram = torch.einsum("bixd,bjxd->bij", vector_normed, vector_normed)
         gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
@@ -413,9 +402,7 @@ class CrystalDualStreamBlock(nn.Module):
         gate = torch.tanh(self.vector_gate(lattice_context)).unsqueeze(2)
 
         vector_hidden = self.vector_ffn_in(vector_normed)
-        vector = vector + gate_update(
-            self.vector_ffn_out(vector_hidden * gate), v_gate
-        )
+        vector = vector + self.vector_ffn_out(vector_hidden * gate)
         return atom, vector
 
 
