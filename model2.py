@@ -303,6 +303,7 @@ class CrystalDualStreamBlock(nn.Module):
         # Invariant atom stream.
         self.atom_norm1 = nn.LayerNorm(dim)
         self.atom_norm2 = nn.LayerNorm(dim)
+        self.atom_norm3 = nn.LayerNorm(dim)
         self.graph_attention = InvariantGraphAttention(
             dim, heads, edge_dim, dropout
         )
@@ -319,6 +320,7 @@ class CrystalDualStreamBlock(nn.Module):
         # Equivariant lattice stream.
         self.vector_norm1 = EquivariantRMSNorm(dim)
         self.vector_norm2 = EquivariantRMSNorm(dim)
+        self.vector_norm3 = EquivariantRMSNorm(dim)
         self.vector_attention = EquivariantVectorAttention(dim, dropout)
         self.vector_cross_attention = EquivariantCrossAttention(dim, dropout)
         self.vector_ffn_in = nn.Linear(dim, hidden, bias=False)
@@ -344,19 +346,21 @@ class CrystalDualStreamBlock(nn.Module):
             vector_normed, atom_normed, padding_mask
         )
 
-        # 3. Atom feed forward.
-        atom = atom + self.atom_ffn(atom)
+        # 3. Atom feed forward: pre-norm, residual bypass.
+        atom = atom + self.atom_ffn(self.atom_norm3(atom))
 
         # 4. Equivariant feed forward: channel mixing gated by invariant
         # scalars. An elementwise activation on xyz would break equivariance.
+        atom_ffn_normed = self.atom_norm3(atom)
         if padding_mask is None:
-            atom_context = atom.mean(dim=1)
+            atom_context = atom_ffn_normed.mean(dim=1)
         else:
             valid = (~padding_mask).to(atom.dtype).unsqueeze(-1)
-            atom_context = (atom * valid).sum(dim=1)
+            atom_context = (atom_ffn_normed * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
-        gram = torch.einsum("bixd,bjxd->bij", vector, vector)
+        vector_ffn_normed = self.vector_norm3(vector)
+        gram = torch.einsum("bixd,bjxd->bij", vector_ffn_normed, vector_ffn_normed)
         gram = gram / vector.shape[-1]
         lattice_context = torch.cat((
             atom_context[:, None, :].expand(-1, 3, -1),
@@ -364,7 +368,7 @@ class CrystalDualStreamBlock(nn.Module):
         ), dim=-1)
         gate = torch.tanh(self.vector_gate(lattice_context)).unsqueeze(2)
 
-        vector_hidden = self.vector_ffn_in(vector)
+        vector_hidden = self.vector_ffn_in(vector_ffn_normed)
         vector = vector + self.vector_ffn_out(vector_hidden * gate)
         return atom, vector
 
