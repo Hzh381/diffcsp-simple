@@ -333,21 +333,32 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
         # 2. Lattice -> atom cross-attention.
-        atom = atom + self.atom_cross_attention(atom, vector)
+        # Both operands are normalized: the raw residuals are unbounded, and
+        # this path feeds the other stream, so consuming them directly creates
+        # an atom <-> vector feedback loop.
+        atom = atom + self.atom_cross_attention(
+            self.atom_ffn_norm(atom), self.vector_norm(vector)
+        )
         atom = atom + self.atom_ffn(self.atom_ffn_norm(atom))
 
         # 3. Lattice self-attention and atom -> lattice cross-attention.
-        vector = vector + self.vector_attention(self.vector_norm(vector))
-        vector = vector + self.vector_cross_attention(
-            self.vector_norm(vector), atom, padding_mask
+        vector = self.vector_norm(
+            vector + self.vector_attention(self.vector_norm(vector))
+        )
+        vector = self.vector_norm(
+            vector
+            + self.vector_cross_attention(
+                self.vector_norm(vector), self.atom_ffn_norm(atom), padding_mask
+            )
         )
 
         # 4. Equivariant FFN. Atom context and lattice metrics form scalar gates.
+        atom_normed = self.atom_ffn_norm(atom)
         if padding_mask is None:
-            atom_context = atom.mean(dim=1)
+            atom_context = atom_normed.mean(dim=1)
         else:
             valid = (~padding_mask).to(atom.dtype).unsqueeze(-1)
-            atom_context = (atom * valid).sum(dim=1)
+            atom_context = (atom_normed * valid).sum(dim=1)
             atom_context = atom_context / valid.sum(dim=1).clamp_min(1.0)
 
         # Normalize before building the metric so the gate sees bounded inputs.
@@ -364,7 +375,9 @@ class CrystalDualStreamBlock(nn.Module):
 
         # Equivariant channels are only multiplied by invariant scalar gates.
         vector_hidden = self.vector_ffn_in(vector_normed)
-        vector = vector + self.vector_ffn_out(vector_hidden * gate)
+        vector = self.vector_norm(
+            vector + self.vector_ffn_out(vector_hidden * gate)
+        )
         return atom, vector
 
 
@@ -379,7 +392,6 @@ class CrystalDualStreamTransformer(nn.Module):
             for _ in range(depth)
         ])
         self.atom_norm = nn.LayerNorm(dim)
-        self.vector_out_norm = EquivariantRMSNorm(dim)
 
     def forward(self, atom, lattice, edge_index=None, edge_attr=None, padding_mask=None):
         vector = self.lattice_embedding(lattice)
@@ -387,7 +399,7 @@ class CrystalDualStreamTransformer(nn.Module):
             atom, vector = block(
                 atom, vector, edge_index, edge_attr, padding_mask
             )
-        return self.atom_norm(atom), self.vector_out_norm(vector)
+        return self.atom_norm(atom), vector
 
 
 class CrystalDualStreamDenoiser(nn.Module):
