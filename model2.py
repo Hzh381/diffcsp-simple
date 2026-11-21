@@ -385,8 +385,15 @@ class CrystalDualStreamTransformer(nn.Module):
         ])
         self.atom_norm = nn.LayerNorm(dim)
 
-    def forward(self, atom, lattice, edge_index=None, edge_attr=None, padding_mask=None):
+    def forward(self, atom, lattice, edge_index=None, edge_attr=None,
+                padding_mask=None, vector_cond=None):
         vector = self.lattice_embedding(lattice)
+        if vector_cond is not None:
+            # Additive bias would break rotation equivariance: a constant added
+            # to every Cartesian component is not invariant under rotation.
+            # A per-channel modulation scales all components equally instead.
+            # tanh bounds the factor to (0, 2) so it cannot amplify without limit.
+            vector = vector * (1.0 + torch.tanh(vector_cond))[:, None, None, :]
         for block in self.blocks:
             atom, vector = block(
                 atom, vector, edge_index, edge_attr, padding_mask
@@ -461,7 +468,8 @@ class CrystalDualStreamDenoiser(nn.Module):
         coord_features = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
 
         atom = self.atom_embedding(padded_types.long())
-        atom = atom + self.time_projection(time_emb)[:, None]
+        time_vec = self.time_projection(time_emb)
+        atom = atom + time_vec[:, None]
         atom = atom + self.coord_embedding(coord_features)
         # The transformer expects columns to be lattice vectors; data.py
         # stores lattice vectors as rows.
@@ -471,6 +479,7 @@ class CrystalDualStreamDenoiser(nn.Module):
             edge_index=None,
             edge_attr=None,
             padding_mask=~node_mask,
+            vector_cond=time_vec,
         )
 
         frac_score = self.frac_head(atom)
