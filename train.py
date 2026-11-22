@@ -183,7 +183,7 @@ def main():
         optimizer,
         mode="min",
         factor=0.6,
-        patience=30,
+        patience=300,
         min_lr=1e-4,
     )
 
