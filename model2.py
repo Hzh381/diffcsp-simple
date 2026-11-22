@@ -501,6 +501,7 @@ class CrystalDualStreamTransformer(nn.Module):
             for _ in range(depth)
         ])
         self.atom_norm = nn.LayerNorm(dim)
+        self.vector_out_norm = EquivariantRMSNorm(dim)
 
     def forward(self, atom, vector, edge_index=None, edge_attr=None,
                 padding_mask=None, edges=None):
@@ -508,7 +509,7 @@ class CrystalDualStreamTransformer(nn.Module):
             atom, vector = block(
                 atom, vector, edge_index, edge_attr, padding_mask, edges=edges
             )
-        return self.atom_norm(atom), vector
+        return self.atom_norm(atom), self.vector_out_norm(vector)
 
 
 class CrystalDualStreamDenoiser(nn.Module):
