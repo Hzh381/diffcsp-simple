@@ -32,14 +32,59 @@ class CrystalDualStreamConfig:
     time_dim: int = 128
     max_atomic_number: int = 100
     expansion: int = 4
-    coord_frequencies: int = 128
+    coord_frequencies: int = 10
     dropout: float = 0.0
+    # Build edge features only for the sum(n_i^2) real atom pairs instead of
+    # the dense padded [B, max_atoms^2, ...] grid. Kept as a flag so the two
+    # layouts can be compared on the same model.
+    sparse_edges: bool = True
 
     def __post_init__(self) -> None:
         if self.hidden_dim % self.heads:
             raise ValueError("hidden_dim must be divisible by heads")
         if self.time_dim % 2:
             raise ValueError("time_dim must be even")
+
+
+def segment_softmax(scores, segment, num_segments):
+    """Softmax over the last ``E`` edges, grouped by ``segment``.
+
+    ``scores`` is ``[E, H]`` and ``segment`` is ``[E]``; each group is one
+    destination atom, so this reproduces a dense row-wise softmax without
+    materialising the ``[B, N, N]`` matrix.
+    """
+    index = segment[:, None].expand_as(scores)
+    maximum = scores.new_full(
+        (num_segments, scores.size(1)), float("-inf")
+    ).scatter_reduce(0, index, scores, reduce="amax", include_self=False)
+    weights = (scores - maximum[segment].detach()).exp()
+    total = scores.new_zeros((num_segments, scores.size(1)))
+    total = total.index_add(0, segment, weights)
+    return weights / total[segment].clamp_min(1e-12)
+
+
+def build_sparse_edges(num_atoms, nodes, device):
+    """Real edges of a padded batch as ``(edge_batch, edge_src, edge_dst)``.
+
+    Only a ``[B, nodes^2]`` boolean mask is built; padded atoms and
+    cross-graph pairs are dropped, leaving ``E = sum_i n_i^2`` edges.
+    ``edge_dst`` receives the message, ``edge_src`` sends it.
+    """
+    grid = torch.cartesian_prod(
+        torch.arange(nodes, device=device),
+        torch.arange(nodes, device=device),
+    )
+    source, target = grid[:, 1], grid[:, 0]
+    counts = num_atoms.to(device=device, dtype=torch.long)[:, None]
+    valid = (source[None, :] < counts) & (target[None, :] < counts)
+    edge_batch = torch.arange(
+        num_atoms.numel(), device=device
+    )[:, None].expand_as(valid)[valid]
+    return (
+        edge_batch,
+        source[None, :].expand_as(valid)[valid],
+        target[None, :].expand_as(valid)[valid],
+    )
 
 
 class InvariantGraphAttention(nn.Module):
@@ -108,7 +153,11 @@ class InvariantGraphAttention(nn.Module):
         dense[:, target, source] = edge_attr
         return dense
 
-    def forward(self, atom, edge_index=None, edge_attr=None, padding_mask=None):
+    def forward(self, atom, edge_index=None, edge_attr=None, padding_mask=None,
+                edges=None):
+        if edges is not None:
+            return self._forward_sparse(atom, edges, edge_attr)
+
         batch, nodes, _ = atom.shape
 
         # Q, K, V: [B, heads, N, head_dim]
@@ -166,6 +215,36 @@ class InvariantGraphAttention(nn.Module):
             message = message.transpose(1, 2).reshape(batch, nodes, self.dim)
 
         return self.output(message)
+
+    def _forward_sparse(self, atom, edges, edge_attr):
+        """Real-edge variant of ``forward``; builds no [B, N, N] tensor."""
+        edge_batch, edge_src, edge_dst = edges
+        batch, nodes, _ = atom.shape
+        heads, head_dim = self.heads, self.head_dim
+        count = edge_batch.numel()
+
+        # The dense branch fuses Q, K, V into one projection. Here the query
+        # comes from the destination atom and the key/value from the source.
+        query = self.qkv(atom[edge_batch, edge_dst])[..., :self.dim]
+        key_value = self.qkv(atom[edge_batch, edge_src])
+        q = query.view(count, heads, head_dim)
+        k = key_value[..., self.dim:2 * self.dim].view(count, heads, head_dim)
+        v = key_value[..., 2 * self.dim:].view(count, heads, head_dim)
+
+        if self.edge_dim > 0:
+            if edge_attr is None:
+                raise ValueError("edge_attr is required when edge_dim > 0")
+            k = k + self.edge_key(edge_attr).view(count, heads, head_dim)
+            v = v + self.edge_value(edge_attr).view(count, heads, head_dim)
+
+        score = (q * k).sum(dim=-1) / math.sqrt(head_dim)      # [E, heads]
+        segment = edge_batch * nodes + edge_dst
+        weight = self.dropout(segment_softmax(score, segment, batch * nodes))
+
+        message = (weight.unsqueeze(-1) * v).view(count, self.dim)
+        pooled = atom.new_zeros(batch * nodes, self.dim)
+        pooled = pooled.index_add(0, segment, message)
+        return self.output(pooled.view(batch, nodes, self.dim))
 
 
 class LatticeVectorEmbedding(nn.Module):
@@ -337,10 +416,11 @@ class CrystalDualStreamBlock(nn.Module):
         )
 
     def forward(self, atom, vector, edge_index=None, edge_attr=None,
-                padding_mask=None):
+                padding_mask=None, edges=None):
         # 1. Intra-stream attention: pre-norm, residual bypass.
         atom = atom + self.graph_attention(
             self.atom_norm1(atom), edge_index, edge_attr, padding_mask,
+            edges=edges,
         )
         vector = vector + self.vector_attention(self.vector_norm1(vector))
 
@@ -392,10 +472,10 @@ class CrystalDualStreamTransformer(nn.Module):
         self.atom_norm = nn.LayerNorm(dim)
 
     def forward(self, atom, vector, edge_index=None, edge_attr=None,
-                padding_mask=None):
+                padding_mask=None, edges=None):
         for block in self.blocks:
             atom, vector = block(
-                atom, vector, edge_index, edge_attr, padding_mask
+                atom, vector, edge_index, edge_attr, padding_mask, edges=edges
             )
         return self.atom_norm(atom), vector
 
@@ -464,26 +544,35 @@ class CrystalDualStreamDenoiser(nn.Module):
         padded_frac[node2graph, positions] = frac_coords
         node_mask[node2graph, positions] = True
 
-        # Pairwise edges on the padded grid, ordered as (source=j, target=i)
-        # to match the dense attention layout. Padded atoms are masked out as
-        # keys by the attention itself.
-        grid = torch.cartesian_prod(
-            torch.arange(max_atoms, device=device),
-            torch.arange(max_atoms, device=device),
-        )
-        source, target = grid[:, 1], grid[:, 0]
-        edge_index = grid[:, [1, 0]].t().contiguous()
+        # Two edge layouts are supported for A/B comparison. With sparse_edges
+        # only the sum(n_i^2) real atom pairs are materialised; otherwise the
+        # dense padded grid [B, max_atoms^2, ...] is built.
+        if self.config.sparse_edges:
+            edges = build_sparse_edges(num_atoms, max_atoms, device)
+            edge_index = None
+            edge_attr = self._sparse_edge_attr(padded_frac, lattice, *edges)
+        else:
+            edges = None
+            # Pairwise edges on the padded grid, ordered as (source=j, target=i)
+            # to match the dense attention layout. Padded atoms are masked out
+            # as keys by the attention itself.
+            grid = torch.cartesian_prod(
+                torch.arange(max_atoms, device=device),
+                torch.arange(max_atoms, device=device),
+            )
+            source, target = grid[:, 1], grid[:, 0]
+            edge_index = grid[:, [1, 0]].t().contiguous()
 
-        # Fourier embedding of the wrapped fractional displacement, plus the
-        # lattice-metric products, following CSPNet's edge features.
-        frac_diff = (padded_frac[:, target] - padded_frac[:, source]) % 1.0
-        phase = frac_diff.unsqueeze(-1) * self.frequencies
-        frac_embedding = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
-        lattice_products = (lattice @ lattice.transpose(-1, -2)).flatten(-2)
-        edge_attr = torch.cat((
-            frac_embedding,
-            lattice_products[:, None, :].expand(-1, grid.size(0), -1),
-        ), dim=-1)
+            # Fourier embedding of the wrapped fractional displacement, plus the
+            # lattice-metric products, following CSPNet's edge features.
+            frac_diff = (padded_frac[:, target] - padded_frac[:, source]) % 1.0
+            phase = frac_diff.unsqueeze(-1) * self.frequencies
+            frac_embedding = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
+            lattice_products = (lattice @ lattice.transpose(-1, -2)).flatten(-2)
+            edge_attr = torch.cat((
+                frac_embedding,
+                lattice_products[:, None, :].expand(-1, grid.size(0), -1),
+            ), dim=-1)
 
         atom = self.atom_embedding(padded_types.long())
         # The transformer expects columns to be lattice vectors; data.py
@@ -502,11 +591,27 @@ class CrystalDualStreamDenoiser(nn.Module):
             edge_index,
             edge_attr,
             padding_mask=~node_mask,
+            edges=edges,
         )
 
         frac_score = self.frac_head(atom)
         lattice_noise = self.lattice_head(vector).squeeze(-1)
         return lattice_noise, frac_score[node_mask]
+
+    def _sparse_edge_attr(self, padded_frac, lattice, edge_batch, edge_src,
+                          edge_dst):
+        """Per-edge features for the real edges; mirrors the dense branch."""
+        frac_diff = (
+            padded_frac[edge_batch, edge_dst]
+            - padded_frac[edge_batch, edge_src]
+        ) % 1.0
+        phase = frac_diff.unsqueeze(-1) * self.frequencies
+        frac_embedding = torch.cat((phase.sin(), phase.cos()), dim=-1).flatten(-2)
+        lattice_products = (lattice @ lattice.transpose(-1, -2)).flatten(-2)
+        return torch.cat((
+            frac_embedding,
+            lattice_products[edge_batch],
+        ), dim=-1)
 
 
 __all__ = [

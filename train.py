@@ -35,6 +35,13 @@ def parse_args():
     parser.add_argument("--time-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=6)
     parser.add_argument("--num-frequencies", type=int, default=128)
+    parser.add_argument(
+        "--sparse-edges",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="dualstream: only build edges for real atom pairs (default) "
+        "instead of the dense padded grid; use --no-sparse-edges for A/B.",
+    )
     parser.add_argument("--max-atoms", type=int, default=100)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--patience", type=int, default=100)
@@ -141,6 +148,7 @@ def main():
                 time_dim=args.time_dim,
                 num_layers=args.num_layers,
                 max_atomic_number=args.max_atoms,
+                sparse_edges=args.sparse_edges,
             )
         )
     else:
