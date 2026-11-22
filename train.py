@@ -37,10 +37,16 @@ def parse_args():
     parser.add_argument("--num-frequencies", type=int, default=128)
     parser.add_argument(
         "--sparse-edges",
-        action=argparse.BooleanOptionalAction,
+        dest="sparse_edges",
+        action="store_true",
         default=True,
-        help="dualstream: only build edges for real atom pairs (default) "
-        "instead of the dense padded grid; use --no-sparse-edges for A/B.",
+        help="dualstream: only build edges for real atom pairs (default).",
+    )
+    parser.add_argument(
+        "--no-sparse-edges",
+        dest="sparse_edges",
+        action="store_false",
+        help="dualstream: build edges on the dense padded grid instead.",
     )
     parser.add_argument("--max-atoms", type=int, default=100)
     parser.add_argument("--timesteps", type=int, default=1000)
