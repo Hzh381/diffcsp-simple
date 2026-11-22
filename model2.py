@@ -32,7 +32,7 @@ class CrystalDualStreamConfig:
     time_dim: int = 128
     max_atomic_number: int = 100
     expansion: int = 4
-    coord_frequencies: int = 10
+    coord_frequencies: int = 128
     dropout: float = 0.0
     # Build edge features only for the sum(n_i^2) real atom pairs instead of
     # the dense padded [B, max_atoms^2, ...] grid. Kept as a flag so the two
@@ -538,6 +538,10 @@ class CrystalDualStreamDenoiser(nn.Module):
         # Edge features: Fourier embedding of the wrapped fractional
         # displacement (6 * F) plus the 9 lattice-metric products, as in CSPNet.
         self.edge_dim = 6 * config.coord_frequencies + 9
+        # The Fourier terms are bounded but the lattice products are not, so
+        # normalise the concatenation to keep attention logits on a common
+        # scale across structures (Crysformer's PairEmbedding does the same).
+        self.edge_norm = nn.LayerNorm(self.edge_dim)
         self.lattice_embedding = LatticeVectorEmbedding(config.hidden_dim)
         self.time_projection = nn.Linear(config.time_dim, config.hidden_dim)
         self.net = CrystalDualStreamTransformer(
@@ -604,6 +608,8 @@ class CrystalDualStreamDenoiser(nn.Module):
                 frac_embedding,
                 lattice_products[:, None, :].expand(-1, grid.size(0), -1),
             ), dim=-1)
+
+        edge_attr = self.edge_norm(edge_attr)
 
         atom = self.atom_embedding(padded_types.long())
         # The transformer expects columns to be lattice vectors; data.py

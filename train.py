@@ -154,6 +154,7 @@ def main():
                 time_dim=args.time_dim,
                 num_layers=args.num_layers,
                 max_atomic_number=args.max_atoms,
+                coord_frequencies=args.num_frequencies,
                 sparse_edges=args.sparse_edges,
             )
         )
