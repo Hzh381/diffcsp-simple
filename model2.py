@@ -46,6 +46,40 @@ class CrystalDualStreamConfig:
             raise ValueError("time_dim must be even")
 
 
+def _segment_max_legacy(scores, segment, num_segments):
+    """Per-segment max for PyTorch versions without ``scatter_reduce``."""
+    order = torch.argsort(segment)
+    sorted_segment = segment[order]
+    sorted_scores = scores[order]
+    last = torch.ones_like(sorted_segment, dtype=torch.bool)
+    last[:-1] = sorted_segment[:-1] != sorted_segment[1:]
+    # Shift each segment by a span larger than the global score range so the
+    # cumulative max never carries a value across segment borders.
+    span = (scores.max() - scores.min() + 1.0).clamp_min(1.0)
+    offset = sorted_segment.to(scores.dtype)[:, None] * span
+    running = torch.cummax(sorted_scores + offset, dim=0).values - offset
+    maximum = scores.new_full(
+        (num_segments, scores.size(1)), float("-inf")
+    )
+    maximum[sorted_segment[last]] = running[last]
+    return maximum
+
+
+def segment_max(scores, segment, num_segments):
+    """Per-segment maximum of ``[E, H]`` scores.
+
+    ``Tensor.scatter_reduce`` only exists in PyTorch >= 1.12; for older
+    versions fall back to a sort + cumulative-max formulation.
+    """
+    index = segment[:, None].expand_as(scores)
+    try:
+        return scores.new_full(
+            (num_segments, scores.size(1)), float("-inf")
+        ).scatter_reduce(0, index, scores, reduce="amax", include_self=False)
+    except AttributeError:
+        return _segment_max_legacy(scores, segment, num_segments)
+
+
 def segment_softmax(scores, segment, num_segments):
     """Softmax over the last ``E`` edges, grouped by ``segment``.
 
@@ -53,10 +87,7 @@ def segment_softmax(scores, segment, num_segments):
     destination atom, so this reproduces a dense row-wise softmax without
     materialising the ``[B, N, N]`` matrix.
     """
-    index = segment[:, None].expand_as(scores)
-    maximum = scores.new_full(
-        (num_segments, scores.size(1)), float("-inf")
-    ).scatter_reduce(0, index, scores, reduce="amax", include_self=False)
+    maximum = segment_max(scores, segment, num_segments)
     weights = (scores - maximum[segment].detach()).exp()
     total = scores.new_zeros((num_segments, scores.size(1)))
     total = total.index_add(0, segment, weights)
