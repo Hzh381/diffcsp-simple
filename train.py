@@ -68,6 +68,8 @@ def move_batch(batch, device):
 def run_epoch(diffusion, loader, optimizer, device, training=True):
     diffusion.train(training)
     total_loss = 0.0
+    total_lattice = 0.0
+    total_coords = 0.0
     total_graphs = 0
 
     context = torch.enable_grad() if training else torch.no_grad()
@@ -85,10 +87,14 @@ def run_epoch(diffusion, loader, optimizer, device, training=True):
                 torch.nn.utils.clip_grad_value_(diffusion.parameters(), 0.5)
                 optimizer.step()
 
-            total_loss += loss.item() * batch.num_graphs
-            total_graphs += batch.num_graphs
+            graphs = batch.num_graphs
+            total_loss += loss.item() * graphs
+            total_lattice += losses["loss_lattice"].item() * graphs
+            total_coords += losses["loss_coords"].item() * graphs
+            total_graphs += graphs
 
-    return total_loss / max(total_graphs, 1)
+    denom = max(total_graphs, 1)
+    return total_loss / denom, total_lattice / denom, total_coords / denom
 
 
 def save_checkpoint(path, diffusion, optimizer, scheduler, args, epoch, best_val, model_config):
@@ -202,22 +208,48 @@ def main():
     metrics_file = metrics_path.open("a" if args.resume else "w", newline="")
     writer = csv.writer(metrics_file)
     if write_header:
-        writer.writerow(["epoch", "train_loss", "val_loss", "lr", "seconds"])
+        writer.writerow([
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "lr",
+            "seconds",
+            "train_lattice",
+            "train_coords",
+            "val_lattice",
+            "val_coords",
+        ])
 
     stale_epochs = 0
     for epoch in range(start_epoch, args.epochs):
         start = time.time()
-        train_loss = run_epoch(diffusion, train_loader, optimizer, device, training=True)
-        val_loss = run_epoch(diffusion, val_loader, optimizer, device, training=False)
+        train_loss, train_lattice, train_coords = run_epoch(
+            diffusion, train_loader, optimizer, device, training=True
+        )
+        val_loss, val_lattice, val_coords = run_epoch(
+            diffusion, val_loader, optimizer, device, training=False
+        )
         scheduler.step(val_loss)
         lr = optimizer.param_groups[0]["lr"]
         elapsed = time.time() - start
 
-        writer.writerow([epoch, train_loss, val_loss, lr, round(elapsed, 3)])
+        writer.writerow([
+            epoch,
+            train_loss,
+            val_loss,
+            lr,
+            round(elapsed, 3),
+            train_lattice,
+            train_coords,
+            val_lattice,
+            val_coords,
+        ])
         metrics_file.flush()
         print(
             f"epoch {epoch:04d} | train {train_loss:.6f} | "
-            f"val {val_loss:.6f} | lr {lr:.2e} | {elapsed:.1f}s"
+            f"val {val_loss:.6f} | lr {lr:.2e} | {elapsed:.1f}s "
+            f"| lat {train_lattice:.4f}/{val_lattice:.4f} "
+            f"| coord {train_coords:.4f}/{val_coords:.4f}"
         )
 
         improved = val_loss < best_val
