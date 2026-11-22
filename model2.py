@@ -45,10 +45,12 @@ class CrystalDualStreamConfig:
 class InvariantGraphAttention(nn.Module):
     """Dense graph attention over invariant atom features.
 
-    For edge j -> i:
-        score[i,j] = q[i] dot k[j] / sqrt(d) + edge_bias[i,j]
-        message[i,j] = v[j] + edge_value[i,j]
-        output[i] = sum_j softmax_j(score[i,j]) * message[i,j]
+    For edge j -> i the edge embedding is added to the key and the value
+    before attention:
+        k[i,j] = W_k h[j] + W_ek e[i,j]
+        v[i,j] = W_v h[j] + W_ev e[i,j]
+        score[i,j] = q[i] dot k[i,j] / sqrt(d)
+        output[i] = sum_j softmax_j(score[i,j]) * v[i,j]
 
     A dense attention matrix is used here for readability. For small crystal
     graphs this is usually practical; edge_index defines which pairs connect.
@@ -69,10 +71,10 @@ class InvariantGraphAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         if edge_dim > 0:
-            self.edge_bias = nn.Linear(edge_dim, heads, bias=False)
+            self.edge_key = nn.Linear(edge_dim, dim, bias=False)
             self.edge_value = nn.Linear(edge_dim, dim, bias=False)
         else:
-            self.edge_bias = None
+            self.edge_key = None
             self.edge_value = None
 
     def _make_graph_mask(self, edge_index, batch, nodes, device):
@@ -115,10 +117,6 @@ class InvariantGraphAttention(nn.Module):
         k = k.view(batch, nodes, self.heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, nodes, self.heads, self.head_dim).transpose(1, 2)
 
-        # Attention scores: [B, heads, N, N].
-        score = q @ k.transpose(-2, -1)
-        score = score / math.sqrt(self.head_dim)
-
         if edge_index is None:
             graph_mask = torch.ones(
                 batch, nodes, nodes, dtype=torch.bool, device=atom.device
@@ -128,15 +126,28 @@ class InvariantGraphAttention(nn.Module):
                 edge_index, batch, nodes, atom.device
             )
 
-        dense_edge_attr = None
         if self.edge_dim > 0:
             if edge_index is None:
                 raise ValueError("edge_index is required when edge_dim > 0")
             dense_edge_attr = self._make_edge_features(
                 edge_index, edge_attr, batch, nodes, atom.device
             )
-            edge_bias = self.edge_bias(dense_edge_attr).permute(0, 3, 1, 2)
-            score = score + edge_bias
+            # Add the edge embedding to the keys and values before attention,
+            # so both the score and the message see the pair geometry.
+            edge_key = self.edge_key(dense_edge_attr).view(
+                batch, nodes, nodes, self.heads, self.head_dim
+            ).permute(0, 3, 1, 2, 4)
+            edge_value = self.edge_value(dense_edge_attr).view(
+                batch, nodes, nodes, self.heads, self.head_dim
+            ).permute(0, 3, 1, 2, 4)
+            key = k[:, :, None, :, :] + edge_key       # [B, h, i, j, head_dim]
+            value = v[:, :, None, :, :] + edge_value
+            score = (q[:, :, :, None, :] * key).sum(dim=-1)
+            score = score / math.sqrt(self.head_dim)
+        else:
+            score = q @ k.transpose(-2, -1)
+            score = score / math.sqrt(self.head_dim)
+            value = None
 
         if padding_mask is not None:
             # Padded atoms cannot be used as keys/values.
@@ -145,18 +156,14 @@ class InvariantGraphAttention(nn.Module):
         score = score.masked_fill(~graph_mask[:, None, :, :], -1e9)
         attention = self.dropout(torch.softmax(score, dim=-1))
 
-        # Weighted sum of atom values.
-        message = attention @ v
-        message = message.transpose(1, 2).reshape(batch, nodes, self.dim)
-
-        if dense_edge_attr is not None:
-            edge_value = self.edge_value(dense_edge_attr)
-            edge_value = edge_value.view(
-                batch, nodes, nodes, self.heads, self.head_dim
-            ).permute(0, 3, 1, 2, 4)
-            message = message + (attention.unsqueeze(-1) * edge_value).sum(dim=3).transpose(1, 2).reshape(
-                batch, nodes, self.dim
-            )
+        if value is None:
+            # Weighted sum of atom values.
+            message = attention @ v
+            message = message.transpose(1, 2).reshape(batch, nodes, self.dim)
+        else:
+            # Weighted sum over j of the edge-conditioned values.
+            message = (attention.unsqueeze(-1) * value).sum(dim=3)
+            message = message.transpose(1, 2).reshape(batch, nodes, self.dim)
 
         return self.output(message)
 
