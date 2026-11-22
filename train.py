@@ -82,7 +82,7 @@ def run_epoch(diffusion, loader, optimizer, device, training=True):
 
             if training:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(diffusion.parameters(), 0.5)
+                torch.nn.utils.clip_grad_value_(diffusion.parameters(), 0.5)
                 optimizer.step()
 
             total_loss += loss.item() * batch.num_graphs
